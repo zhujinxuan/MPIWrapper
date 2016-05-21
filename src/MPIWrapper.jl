@@ -1,6 +1,8 @@
 module MPIWrapper
+using NaivePDE
+using MPI
 
 # package code goes here
-include("AreaDistribution/MPIwrapper.jl")
+include("AreaDistribution/MPIWrapper.jl")
 
 end # module

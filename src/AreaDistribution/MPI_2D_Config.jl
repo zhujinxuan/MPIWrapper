@@ -9,18 +9,26 @@ immutable MPI_2D_Config <: MPI_areaConfig
   sN :: Tuple{Int64,Int64}
   OL :: Tuple{Int64,Int64}
   nP :: Tuple{Int64,Int64}
+  rank :: Int64
+  size :: Int64
   function MPI_2D_Config(n :: Tuple{Int64,Int64}, l :: Tuple{Int64,Int64}, p :: Tuple{Int64,Int64})
     @assert n[1] > l[1]
     @assert n[2] > l[2]
-    new(n,l,p)
+    comm = MPI.COMM_WORLD
+    new(n,l,p, MPI.Comm_rank(comm), MPI.Comm_size(comm))
   end
 end
 
-function MPI2D_GatherAll!(p :: MPI_2D_Config, T :: Array{Float64,2}, rank :: Int64, Twhole :: Array{Float64,2})
+function MPI2D_InitialArray!(p :: MPI_2D_Config )
+  return fill(0.0, )
+end
+
+function MPI2D_GatherAll!(p :: MPI_2D_Config, T :: Array{Float64,2}, Twhole :: Array{Float64,2})
   comm = MPI.COMM_WORLD
   (OLx, OLy) = p.OL
   (sNx, sNy) = p.sN
   (nPx, nPy) = p.nP
+  rank = p.rank
 
   if (rank!=0)
     ##  Sending to Coupler
@@ -33,25 +41,26 @@ function MPI2D_GatherAll!(p :: MPI_2D_Config, T :: Array{Float64,2}, rank :: Int
       ix = mod(ip,nPx)
       iy = round(Int64, (ip-ix)/nPx)
       rreq = MPI.Irecv!(Ti, ip, ip+32, comm)
-      Twhole[ix*sNx+ (1:sNx),iy*sNy+(1:sNy)] = Ti[OLx+(1:sNx),OLy + (1:sNy)]
       MPI.Waitall!([rreq;])
+      Twhole[ix*sNx+ (1:sNx),iy*sNy+(1:sNy)] = Ti[OLx+(1:sNx),OLy + (1:sNy)]
     end
   end
   return Twhole
 end
 
-function MPI2D_DistributeCore!(p :: MPI_2D_Config, T :: Array{Float64,2}, rank :: Int64, Twhole :: Array{Float64,2})
+function MPI2D_DistributeCore!(p :: MPI_2D_Config, T :: Array{Float64,2},  Twhole :: Array{Float64,2})
   comm = MPI.COMM_WORLD
   (OLx, OLy) = p.OL
   (sNx, sNy) = p.sN
   (nPx, nPy) = p.nP
+  rank = p.rank
 
-  if (rank!=0)
+  if (rank != 0)
     ##  Receiving From Coupler
     Ti = fill(NaN, p.sN)
     csreq = MPI.Irecv!(Ti,0, rank+32,comm)
-    T[OLx+(1:sNx), OLy+(1:sNy)] = Ti
     MPI.Waitall!([csreq;])
+    T[OLx+(1:sNx), OLy+(1:sNy)] = Ti
   else
     Ti = fill(NaN, size(T))
     T[(1+OLx):(OLx+sNx),(1+OLy):(OLy+sNy)] =  Twhole[1:sNx, 1:sNy]
@@ -68,18 +77,19 @@ function MPI2D_DistributeCore!(p :: MPI_2D_Config, T :: Array{Float64,2}, rank :
   return Twhole
 end
 
-function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, rank :: Int64, Twhole :: Array{Float64,2})
+function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2},  Twhole :: Array{Float64,2})
   comm = MPI.COMM_WORLD
   #= MPI.Barrier(comm) =#
   (OLx, OLy) = p.OL
   (sNx, sNy) = p.sN
   (nPx, nPy) = p.nP
+  rank = p.rank
 
   if (rank!=0)
 
     crreq = Array(MPI.Request,4)
     Twest = fill(NaN, (OLx, sNy))
-    Tnorth = fill(NaN,(sNx, OLy) )
+    Tnorth = fill(NaN,(sNx, OLy))
     Teast = fill(NaN, (OLx, sNy))
     Tsouth = fill(NaN, (sNx, OLy))
 
@@ -96,9 +106,9 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
   else
 
     Twest = Twhole[sNx*nPx-OLx+(1:OLx),1:sNy]
-    Tnorth = Twhole[1:sNx, sNy+(1:OLy)]
-    Teast  = Twhole[sNx+(1:OLx),1:sNy]
-    Tsouth = Twhole[1:sNx, sNy*nPy-OLy+(1:OLy)]
+    Tnorth = Twhole[1:sNx, mod(sNy+(1:OLy)-1, sNy*nPy)+1]
+    Teast  = Twhole[mod(sNx+(1:OLx)-1, sNx*nPx )+1,1:sNy]
+    Tsouth = Twhole[1:sNx, mod(sNy*nPy-OLy+(1:OLy)-1,sNy*nPy)+1] 
 
     T[1:OLx,OLy+(1:sNy)] = Twest
     T[OLx+(1:sNx),sNy+OLy+(1:OLy)] = Tnorth
@@ -115,7 +125,7 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
       iwy = iy
       pendingx = (iwx+1)*sNx-OLx
       pendingy = (iwy)*sNy
-      Twest = T[pendingx+(1:OLx), pendingy+(1:sNy)]
+      Twest = Twhole[pendingx+(1:OLx), pendingy+(1:sNy)]
       sreq[1] = MPI.Isend(Twest, ip, ip*4+1, comm)
 
       # Sending North Boundary
@@ -123,7 +133,7 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
       iwy = mod(iy+1,nPy)
       pendingx = iwx*sNx
       pendingy = iwy*sNy 
-      Tnorth = T[pendingx+(1:sNx), pendingy+(1:OLy)]
+      Tnorth = Twhole[pendingx+(1:sNx), pendingy+(1:OLy)]
       sreq[2] = MPI.Isend(Tnorth, ip, ip*4+2, comm)
       
       # Sending East Boundary
@@ -131,7 +141,7 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
       iwy = iy
       pendingx = iwx*sNx
       pendingy = iwy*sNy 
-      Twest = T[pendingx+(1:OLx), pendingy+(1:sNy)]
+      Twest = Twhole[pendingx+(1:OLx), pendingy+(1:sNy)]
       sreq[3] = MPI.Isend(Teast, ip, ip*4+3, comm)
       
       # Sending South Boundary
@@ -139,7 +149,7 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
       iwy = mod(iy-1,nPy)
       pendingx = iwx*sNx
       pendingy = (iwy+1)*sNy-OLy
-      Twest = T[pendingx+(1:sNx), pendingy+(1:OLy)]
+      Twest = Twhole[pendingx+(1:sNx), pendingy+(1:OLy)]
       sreq[4] = MPI.Isend(Tsouth, ip, ip*4+4, comm)
       
       MPI.Waitall!(sreq)
@@ -147,6 +157,33 @@ function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,2}, ra
     end
   end
   return T
+end
+
+function MPI2D_GatherAll!(p :: MPI_2D_Config, T :: Array{Float64,3}, Twhole :: Array{Float64,3})
+  for ii = 1:size(T,3)
+    T1 = T[:,:,ii]
+    Twhole1 = Twhole[:,:,ii]
+    MPI2D_GatherAll!(p,T1, Twhole1)
+  end
+  return Twhole1
+end
+
+function MPI2D_DistributeCore!(p :: MPI_2D_Config, T :: Array{Float64,3}, Twhole :: Array{Float64,3})
+  for ii = 1:size(T,3)
+    T1 = T[:,:,ii]
+    Twhole1 = Twhole[:,:,ii]
+    MPI2D_DistributeCore!(p,T1,  Twhole1)
+  end
+  return Twhole1
+end
+
+function MPI2D_DistributeBoundary!(p :: MPI_2D_Config, T :: Array{Float64,3},  Twhole :: Array{Float64,3})
+  for ii = 1:size(T,3)
+    T1 = T[:,:,ii]
+    Twhole1 = Twhole[:,:,ii]
+    MPI2D_DistributeBoundary!(p,T1, Twhole1)
+  end
+  return Twhole1
 end
 
 export MPI_2D_Config
